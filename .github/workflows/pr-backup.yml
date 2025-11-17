@@ -1,0 +1,156 @@
+name: PR Backup
+
+on:
+  schedule:
+    - cron: "0 0 * * 3,6" # Runs twice a week: Wednesday and Saturday at midnight UTC
+
+jobs:
+  backup-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install GitHub CLI and Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh jq zip rsync
+
+      - name: Create Backup Folder
+        run: mkdir -p backups
+
+      - name: Set backup date
+        id: backup_date
+        run: echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+      - name: Fetch and Backup All PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get all open PRs to backup
+          pr_list=$(gh pr list --state open --json number --jq '.[].number' | tr '\n' ' ')
+          
+          if [ -z "$pr_list" ]; then
+            echo "📭 No open PRs found to backup."
+            exit 0
+          fi
+          
+          echo "📦 Found open PRs to backup: $pr_list"
+          echo "📊 Total PRs: $(echo $pr_list | wc -w)"
+          
+          # Backup each PR
+          for pr in $pr_list; do
+            echo ""
+            echo "🔄 Processing PR #$pr"
+            
+            # Get PR information
+            pr_info=$(gh pr view $pr --json headRefName,headRepository)
+            pr_branch=$(echo "$pr_info" | jq -r '.headRefName')
+            pr_repo=$(echo "$pr_info" | jq -r '.headRepository.name')
+            pr_owner=$(echo "$pr_info" | jq -r '.headRepository.owner.login')
+            
+            echo "   Branch: $pr_branch"
+            echo "   Repository: $pr_owner/$pr_repo"
+            
+            # Save current branch
+            current_branch=$(git branch --show-current || echo "main")
+            
+            # Checkout PR branch using GitHub CLI (handles forks automatically)
+            echo "   Checking out PR branch..."
+            if gh pr checkout $pr --force; then
+              echo "   ✅ Successfully checked out PR branch"
+            else
+              echo "   ❌ Failed to checkout PR #$pr"
+              continue
+            fi
+            
+            # Extract team name from submission folder
+            team_name=""
+            if [ -d "submissions" ]; then
+              # Find the submission folder (should be only one per PR)
+              submission_folder=$(find submissions -mindepth 1 -maxdepth 1 -type d | head -n 1 | xargs basename 2>/dev/null || echo "")
+              if [ -n "$submission_folder" ] && [ "$submission_folder" != "submissions" ]; then
+                team_name="$submission_folder"
+                echo "   Found team folder: $team_name"
+              fi
+            fi
+            
+            # If no team name found, use PR number as fallback
+            if [ -z "$team_name" ]; then
+              team_name="PR-$pr"
+              echo "   ⚠️  No team folder found, using PR number"
+            fi
+            
+            # Create backup filename using team name and date
+            current_date=$(date +%Y%m%d)
+            backup_filename="${team_name}_${current_date}"
+            
+            # Create temporary directory for this PR
+            tempDir="pr-$pr-$(date +%Y%m%d%H%M%S)"
+            mkdir -p "$tempDir"
+            
+            # Copy entire repository contents (complete codebase, not just changes)
+            echo "   Copying complete repository contents..."
+            rsync -a \
+              --exclude='.git' \
+              --exclude='node_modules' \
+              --exclude='.venv' \
+              --exclude='venv' \
+              --exclude='__pycache__' \
+              --exclude='*.pyc' \
+              --exclude='.DS_Store' \
+              --exclude='Thumbs.db' \
+              --exclude='backups' \
+              . "$tempDir/" 2>/dev/null || {
+              # Fallback: use cp for compatibility
+              echo "   Using fallback copy method..."
+              find . -mindepth 1 -maxdepth 1 \
+                ! -name '.git' \
+                ! -name 'node_modules' \
+                ! -name '.venv' \
+                ! -name 'venv' \
+                ! -name '__pycache__' \
+                ! -name 'backups' \
+                -exec cp -r {} "$tempDir/" \; 2>/dev/null || true
+            }
+            
+            # Create zip archive with team name and date
+            echo "   Creating backup archive: ${backup_filename}.zip"
+            cd "$tempDir"
+            zip -r "../backups/${backup_filename}.zip" . -q || {
+              echo "   ⚠️  Zip failed, trying tar..."
+              cd ..
+              tar -czf "backups/${backup_filename}.tar.gz" -C "$tempDir" . || true
+            }
+            cd ..
+            
+            # Cleanup
+            rm -rf "$tempDir"
+            
+            # Return to original branch
+            git checkout "$current_branch" 2>/dev/null || git checkout main || true
+            
+            echo "   ✅ PR #$pr backed up successfully"
+          done
+          
+          # Ensure we're back on main branch before finalizing
+          git checkout main 2>/dev/null || git checkout "$current_branch" 2>/dev/null || true
+          
+          echo ""
+          echo "📊 Backup Summary:"
+          ls -lh backups/ 2>/dev/null | tail -n +2 || echo "   No backups created"
+          
+          # Move zip files to root level to avoid nested folder structure in artifact
+          if [ -d "backups" ] && ls backups/*.zip 1> /dev/null 2>&1; then
+            mv backups/*.zip . 2>/dev/null || true
+            echo "📦 Moved zip files to root level for direct artifact upload"
+          fi
+
+      - name: Upload Backups as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ steps.backup_date.outputs.date }}
+          path: "*.zip"
+          retention-days: 30
